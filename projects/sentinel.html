@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Sentinel AI Task Processor &mdash; Engineering Behind This</title>
+  <link rel="stylesheet" href="../style.css">
+  <script>
+    (function(){
+      var s = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', s);
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <a href="../index.html" class="back">&larr; All projects</a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+      </div>
+      <div class="project-header">
+        <h1>Sentinel AI Task Processor</h1>
+        <p class="subtitle">Distributed background job processing system for asynchronous AI tasks. Redis Streams for queueing, PostgreSQL for persistence, Google Gemini for inference, and real-time monitoring via SSE &mdash; all containerized with Docker.</p>
+        <div class="links">
+          <a href="https://github.com/Ridhesh05/Sentinel-AI-Task-Processor" target="_blank">Source Code</a>
+        </div>
+        <div class="tags" style="margin-top: 16px;">
+          <span class="tag">Python</span>
+          <span class="tag">FastAPI</span>
+          <span class="tag">Redis Streams</span>
+          <span class="tag">PostgreSQL</span>
+          <span class="tag">Google Gemini</span>
+          <span class="tag">Docker</span>
+          <span class="tag">Prometheus</span>
+          <span class="tag">SSE</span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <!-- ─── The Problem ─── -->
+      <section>
+        <h2>The Problem</h2>
+        <p>AI inference is slow and unpredictable. If your API blocks while waiting for a model response, every client stalls. Retries hammer the provider, rate limits bite, and you have zero visibility into what's queued, running, or failed.</p>
+        <p style="margin-top: 10px;">Sentinel solves this by <strong>decoupling submission from processing</strong>. The API accepts a task and returns immediately. A separate worker pool consumes from a Redis Stream, calls Gemini, persists results, and pushes real-time status updates to connected browsers &mdash; all with exactly-once delivery semantics and full observability.</p>
+      </section>
+
+      <!-- ─── Architecture ─── -->
+      <section>
+        <h2>Architecture</h2>
+        <div class="diagram-container" id="arch-diagram">
+          <pre class="mermaid">
+flowchart TB
+    subgraph Client
+        Browser["Browser UI<br/>(Port 3000)"]
+    end
+
+    subgraph API["API Service (FastAPI :8000)"]
+        Submit["POST /tasks"]
+        Query["GET /tasks"]
+        Retry["POST /tasks/:id/retry"]
+        Health["Health + Metrics"]
+        RateLimit["Rate Limiter<br/>(Redis counter)"]
+        Snowflake["Snowflake ID Gen"]
+    end
+
+    subgraph Queue["Message Queue"]
+        Stream["Redis Stream<br/>task_queue"]
+        CGroup["Consumer Group<br/>(XREADGROUP)"]
+        PubSub["Redis Pub/Sub<br/>(status events)"]
+    end
+
+    subgraph Worker["Worker Service (:9100)"]
+        Consumer["Stream Consumer"]
+        Gemini["Google Gemini<br/>API Call"]
+        Persist["PostgreSQL Upsert"]
+        Publish["Event Publisher"]
+    end
+
+    subgraph Monitor["Monitor Service (:9000)"]
+        SSE["SSE Endpoint<br/>/events"]
+    end
+
+    subgraph Storage
+        PG["PostgreSQL 15<br/>(source of truth)"]
+        Redis["Redis 7<br/>(queue + cache + pubsub)"]
+    end
+
+    Browser -->|"submit task"| Submit
+    Browser -->|"poll / fetch"| Query
+    Browser -->|"retry failed"| Retry
+    Browser -->|"subscribe"| SSE
+
+    Submit --> RateLimit
+    RateLimit --> Snowflake
+    Snowflake -->|"XADD"| Stream
+    Stream --> CGroup
+    CGroup --> Consumer
+    Consumer --> Gemini
+    Consumer --> Persist
+    Persist --> PG
+    Consumer --> Publish
+    Publish -->|"PUBLISH"| PubSub
+    PubSub -->|"subscribe"| SSE
+    Query -->|"SELECT"| PG
+    Health -->|"ping"| Redis
+    Health -->|"ping"| PG
+          </pre>
+        </div>
+      </section>
+
+      <!-- ─── Data Flow ─── -->
+      <section>
+        <h2>How Data Flows</h2>
+
+        <h3>Write Path (Client submits a task)</h3>
+        <div class="flow-step">
+          <div class="step-label">Step 1 &mdash; Accept</div>
+          <p><code>POST /tasks</code> validates the payload, checks the Redis rate limiter, generates a <strong>Snowflake ID</strong> (64-bit, no DB round-trip), and calls <code>XADD</code> to push the task onto the Redis Stream. Returns the task ID immediately &mdash; the client never waits for inference.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 2 &mdash; Process</div>
+          <p>The worker service reads from the stream via <code>XREADGROUP</code> (consumer group ensures each task is delivered exactly once). It calls the <strong>Google Gemini API</strong>, handles errors and retries, then upserts the result into <strong>PostgreSQL</strong>.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 3 &mdash; Notify</div>
+          <p>After persistence, the worker publishes a status event to <strong>Redis Pub/Sub</strong>. The monitor service picks it up and fans it out to all connected browsers via <strong>Server-Sent Events</strong>. The UI updates in real time &mdash; no polling needed.</p>
+        </div>
+
+        <h3>Read Path (Client checks status)</h3>
+        <div class="flow-step">
+          <div class="step-label">Step 1 &mdash; Query</div>
+          <p><code>GET /tasks/{id}</code> reads directly from PostgreSQL. For listing recent tasks, <code>GET /tasks</code> returns the latest entries ordered by creation time.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 2 &mdash; Retry</div>
+          <p><code>POST /tasks/{id}/retry</code> resubmits a failed task back to the Redis Stream with the same ID. The worker picks it up again &mdash; idempotent upserts make this safe.</p>
+        </div>
+      </section>
+
+      <!-- ─── Why These Choices ─── -->
+      <section>
+        <h2>Why These Choices</h2>
+        <table class="decision-table">
+          <thead>
+            <tr><th>Decision</th><th>Why</th><th>Tradeoff</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Redis Streams over Celery/RabbitMQ</td>
+              <td>Built-in consumer groups, message acknowledgement, and backpressure. No extra broker &mdash; Redis already handles rate limiting and pub/sub.</td>
+              <td>Less ecosystem tooling than Celery. No built-in periodic tasks. Worth it for the simplicity of a single Redis dependency.</td>
+            </tr>
+            <tr>
+              <td>Snowflake IDs</td>
+              <td>64-bit, time-sortable, globally unique without a DB sequence. Generated at the API layer &mdash; no round-trip before queuing.</td>
+              <td>Requires clock synchronization across nodes. Fine for a single-node setup; in multi-node you'd add a machine ID.</td>
+            </tr>
+            <tr>
+              <td>SSE over WebSockets</td>
+              <td>Unidirectional updates are all we need (server &rarr; browser). SSE is simpler, auto-reconnects, works through HTTP proxies.</td>
+              <td>No bidirectional channel. Clients still use REST for commands. That's the right split here.</td>
+            </tr>
+            <tr>
+              <td>PostgreSQL as source of truth</td>
+              <td>ACID guarantees on task state. Redis is ephemeral by design &mdash; if it restarts, PG has the complete history. Supports complex queries for analytics.</td>
+              <td>Extra write on every task completion. Worth it &mdash; Redis Streams aren't designed for long-term storage.</td>
+            </tr>
+            <tr>
+              <td>FastAPI</td>
+              <td>Async-native, automatic OpenAPI docs, Pydantic validation. Fits naturally with async Redis and DB clients.</td>
+              <td>Python's GIL limits CPU-bound throughput. Not a concern here &mdash; the bottleneck is Gemini API latency, not CPU.</td>
+            </tr>
+            <tr>
+              <td>Three separate services</td>
+              <td>API, Worker, and Monitor scale independently. Worker can be scaled horizontally &mdash; consumer groups handle partitioning. Monitor is stateless.</td>
+              <td>More containers to manage. Docker Compose handles this in dev; in prod, Kubernetes would orchestrate.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ─── Key Engineering Details ─── -->
+      <section>
+        <h2>Key Engineering Details</h2>
+        <ul>
+          <li><strong>Exactly-once processing</strong> &mdash; Redis consumer groups with <code>XREADGROUP</code> + <code>XACK</code>. Each task is delivered to one consumer. Acknowledgement happens only after PG write succeeds. Unacked messages are reclaimed on restart.</li>
+          <li><strong>Rate limiting</strong> &mdash; Sliding window counter in Redis. Configurable via <code>RATE_LIMIT</code> and <code>RATE_WINDOW</code> env vars. Rejects with 429 before any work is done.</li>
+          <li><strong>Health checks (three tiers)</strong> &mdash; <code>/health</code> (full system), <code>/health/live</code> (Kubernetes liveness), <code>/health/ready</code> (readiness &mdash; checks Redis + PG connectivity).</li>
+          <li><strong>Prometheus metrics</strong> &mdash; Exposed at <code>/metrics</code> on each service. Task counts, processing latency histograms, error rates, queue depth.</li>
+          <li><strong>Structured logging</strong> &mdash; JSON or text format via env config. Correlation IDs flow through the entire request lifecycle.</li>
+          <li><strong>Graceful error handling</strong> &mdash; Custom exception hierarchy in <code>core/exceptions.py</code>. Gemini failures don't crash the worker &mdash; tasks are marked failed and available for retry.</li>
+        </ul>
+      </section>
+
+      <!-- ─── Repo Structure ─── -->
+      <section>
+        <h2>Repo Structure</h2>
+        <div class="diagram-container">
+          <pre style="font-size: 0.85rem; line-height: 1.6; color: var(--text);">sentinel-ai-task-processor/
+├── docker-compose.dev.yml      # Dev: API, Worker, Monitor, PG, Redis, Adminer
+├── docker-compose.prod.yml     # Production config
+├── Makefile                    # install, lint, fmt, docker-up/down, clean
+├── core/                       # Shared library
+│   ├── config/                 # Pydantic env config
+│   ├── db.py                   # PostgreSQL connection pool
+│   ├── redis.py                # Sync + async Redis clients
+│   ├── snowflake.py            # 64-bit distributed ID generator
+│   ├── exceptions.py           # Custom exception hierarchy
+│   ├── logging.py              # Structured logging (JSON/text)
+│   └── metrics/                # Prometheus collectors
+├── services/
+│   ├── api/                    # FastAPI REST service (port 8000)
+│   ├── worker/                 # Redis Stream consumer (port 9100)
+│   └── monitor/                # SSE event streaming (port 9000)
+├── infra/sql/                  # PostgreSQL schema + migrations
+├── frontend/                   # Web UI served by Nginx (port 3000)
+└── requirements/               # Python dependency specs</pre>
+        </div>
+      </section>
+
+      <!-- ─── API Surface ─── -->
+      <section>
+        <h2>API Surface</h2>
+        <table class="decision-table">
+          <thead>
+            <tr><th>Method</th><th>Path</th><th>Purpose</th></tr>
+          </thead>
+          <tbody>
+            <tr><td>POST</td><td><code>/tasks</code></td><td>Submit a new AI task</td></tr>
+            <tr><td>GET</td><td><code>/tasks</code></td><td>List recent tasks</td></tr>
+            <tr><td>GET</td><td><code>/tasks/{id}</code></td><td>Get task details + result</td></tr>
+            <tr><td>POST</td><td><code>/tasks/{id}/retry</code></td><td>Resubmit a failed task</td></tr>
+            <tr><td>GET</td><td><code>/health</code></td><td>Full system health check</td></tr>
+            <tr><td>GET</td><td><code>/events</code></td><td>Real-time SSE stream</td></tr>
+            <tr><td>GET</td><td><code>/metrics</code></td><td>Prometheus metrics</td></tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ─── What's Next ─── -->
+      <section>
+        <h2>What I'd Do Next</h2>
+        <ul>
+          <li><strong>Horizontal worker scaling</strong> &mdash; Add machine ID to Snowflake gen, test with multiple consumer group members</li>
+          <li><strong>Dead letter queue</strong> &mdash; Move permanently failed tasks to a DLQ stream with alerting</li>
+          <li><strong>Priority queues</strong> &mdash; Multiple Redis Streams with weighted consumption for task priorities</li>
+          <li><strong>Grafana dashboards</strong> &mdash; Wire Prometheus metrics into pre-built dashboards for queue depth, latency p50/p99, error rates</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      <p>Ridhesh &middot; <a href="../index.html" style="color: var(--muted);">All projects</a></p>
+    </footer>
+  </div>
+  <script>
+    // Store raw mermaid source before it gets replaced by SVG
+    var mermaidSource = document.querySelector('#arch-diagram .mermaid').textContent;
+
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    mermaid.initialize({ startOnLoad: true, theme: isDark ? 'dark' : 'neutral' });
+
+    async function rerenderDiagram() {
+      var container = document.getElementById('arch-diagram');
+      var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      container.innerHTML = '';
+      var pre = document.createElement('pre');
+      pre.className = 'mermaid';
+      pre.textContent = mermaidSource;
+      container.appendChild(pre);
+      mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'neutral' });
+      await mermaid.run({ nodes: [pre] });
+    }
+
+    var btn = document.querySelector('.theme-toggle');
+    function setLabel() {
+      btn.textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+    }
+    setLabel();
+    btn.addEventListener('click', function() {
+      var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      setLabel();
+      rerenderDiagram();
+    });
+  </script>
+</body>
+</html>
