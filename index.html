@@ -1,0 +1,63 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Engineering Behind This</title>
+  <link rel="stylesheet" href="style.css">
+  <script>
+    (function(){
+      var s = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', s);
+    })();
+  </script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <h1>Engineering Behind This</h1>
+      <p>How I build things &mdash; architecture, tradeoffs, and why.</p>
+      <nav>
+        <a href="https://github.com/Ridhesh05" target="_blank">GitHub</a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+      </nav>
+    </header>
+
+    <main class="project-list">
+      <a href="projects/zepkit.html" class="project-card">
+        <h2>ZepKit &mdash; Multilingual Semantic Search</h2>
+        <p>Blinkit/Zepto-style grocery search that works in 14 Indian languages. Hybrid keyword + vector search, Kafka-driven ingestion, voice search, recipe intent detection.</p>
+        <div class="tags">
+          <span class="tag">Node.js</span>
+          <span class="tag">Kafka</span>
+          <span class="tag">TypeSense</span>
+          <span class="tag">Redis</span>
+          <span class="tag">MongoDB</span>
+          <span class="tag">Ollama</span>
+          <span class="tag">Hybrid Search</span>
+          <span class="tag">Multilingual</span>
+        </div>
+      </a>
+
+      <!-- Add more project cards here -->
+    </main>
+
+    <footer>
+      <p>Ridhesh &middot; Built to explain, not to impress.</p>
+    </footer>
+  </div>
+  <script>
+    var btn = document.querySelector('.theme-toggle');
+    function setLabel() {
+      btn.textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+    }
+    setLabel();
+    btn.addEventListener('click', function() {
+      var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      setLabel();
+    });
+  </script>
+</body>
+</html>

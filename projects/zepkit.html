@@ -1,0 +1,265 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>ZepKit &mdash; Engineering Behind This</title>
+  <link rel="stylesheet" href="../style.css">
+  <script>
+    (function(){
+      var s = localStorage.getItem('theme') || (matchMedia('(prefers-color-scheme: dark)').matches ? 'dark' : 'light');
+      document.documentElement.setAttribute('data-theme', s);
+    })();
+  </script>
+  <script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+</head>
+<body>
+  <div class="container">
+    <header>
+      <div style="display: flex; justify-content: space-between; align-items: center;">
+        <a href="../index.html" class="back">&larr; All projects</a>
+        <button class="theme-toggle" aria-label="Toggle theme"></button>
+      </div>
+      <div class="project-header">
+        <h1>ZepKit</h1>
+        <p class="subtitle">Multilingual semantic search for quick-commerce. Search in Hindi, Tamil, Bengali, Hinglish, English &mdash; with typos, slang, and natural language &mdash; and find the right product at your nearest dark store.</p>
+        <div class="links">
+          <a href="https://github.com/Ridhesh05/zepkit" target="_blank">Source Code</a>
+        </div>
+        <div class="tags" style="margin-top: 16px;">
+          <span class="tag">Node.js</span>
+          <span class="tag">Kafka (KRaft)</span>
+          <span class="tag">TypeSense</span>
+          <span class="tag">Redis</span>
+          <span class="tag">MongoDB</span>
+          <span class="tag">Ollama</span>
+          <span class="tag">bge-m3</span>
+          <span class="tag">Gemma 3</span>
+        </div>
+      </div>
+    </header>
+
+    <main>
+      <!-- ─── The Problem ─── -->
+      <section>
+        <h2>The Problem</h2>
+        <p>Plain keyword search breaks the moment the shopper and the catalog disagree on words. An Indian grocery shopper might type <code>aloo</code>, <code>potato</code>, or the same word in Tamil, Bengali, or Devanagari script. They might say "paneer butter masala banana hai" and expect ingredient suggestions. Existing search engines don't handle this out of the box.</p>
+        <p style="margin-top: 10px;">ZepKit solves this with <strong>hybrid search</strong> (meaning + keywords together) and a <strong>14-language tag net</strong> per product, so search just works regardless of language or script.</p>
+      </section>
+
+      <!-- ─── Architecture ─── -->
+      <section>
+        <h2>Architecture</h2>
+        <div class="diagram-container" id="arch-diagram">
+          <pre class="mermaid">
+flowchart TB
+    subgraph Client
+        Shop["Shop UI<br/>(Voice + Search)"]
+        Admin["Admin UI<br/>(Products + Analytics)"]
+    end
+
+    subgraph API["API Gateway (Express :4000)"]
+        Search["GET /search"]
+        Products["POST /products"]
+        Locations["GET /locations/resolve"]
+        Analytics["Search Analytics"]
+    end
+
+    subgraph Processing["Async Processing"]
+        Kafka["Kafka (KRaft)<br/>products.ingest"]
+        DLQ["DLQ<br/>(3 retries)"]
+        Worker["Product Worker<br/>enrich + fan-out"]
+    end
+
+    subgraph AI["AI Service (Ollama :4001)"]
+        BGE["bge-m3<br/>multilingual embeddings"]
+        Gemma["Gemma 3 4B<br/>tag generation"]
+        Guard["guardTags()<br/>content safety"]
+        Recipe["Recipe Detection<br/>KB + LLM fallback"]
+    end
+
+    subgraph Storage
+        Mongo["MongoDB<br/>(source of truth)"]
+        TS["TypeSense<br/>(hybrid search index)"]
+        Redis["Redis<br/>(hot cache)"]
+    end
+
+    Shop --> Search
+    Shop --> Locations
+    Admin --> Products
+    Admin --> Analytics
+
+    Products -->|"publish event"| Kafka
+    Kafka --> Worker
+    Kafka -.->|"3 failures"| DLQ
+    Worker --> BGE
+    Worker --> Gemma
+    Worker --> Guard
+    Worker -->|"upsert"| Mongo
+    Worker -->|"upsert"| TS
+    Worker -->|"cache"| Redis
+
+    Search -->|"cache check"| Redis
+    Search -->|"embed query"| BGE
+    Search -->|"intent"| Recipe
+    Search -->|"hybrid query"| TS
+          </pre>
+        </div>
+      </section>
+
+      <!-- ─── Data Flow ─── -->
+      <section>
+        <h2>How Data Flows</h2>
+
+        <h3>Write Path (Admin adds a product)</h3>
+        <div class="flow-step">
+          <div class="step-label">Step 1 &mdash; Accept</div>
+          <p><code>POST /products</code> assigns an <code>_id</code>, publishes <code>product.created</code> to Kafka, returns <strong>202 Accepted</strong>. The API is done &mdash; no waiting for enrichment.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 2 &mdash; Enrich</div>
+          <p>The Kafka worker picks up the event. It generates <strong>14-language tags</strong> (rule-first dictionary + Gemma 3 fallback), computes a <strong>bge-m3 embedding</strong> (1024-dim multilingual vector), and runs <code>guardTags()</code> content moderation.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 3 &mdash; Fan-out</div>
+          <p>The worker upserts into <strong>MongoDB</strong> (truth), <strong>TypeSense</strong> (search index with <code>store_ids</code>), and <strong>Redis</strong> (cache). Kafka offset is committed only after all three succeed. Idempotent upserts make retries safe.</p>
+        </div>
+
+        <h3>Read Path (User searches)</h3>
+        <div class="flow-step">
+          <div class="step-label">Step 1 &mdash; Cache + Intent</div>
+          <p>Check Redis for cached results. Run <strong>recipe detection</strong>: KB dictionary for known dishes (instant), Gemma 3 LLM fallback for novel ones. Parse price filters from natural language (<code>amul doodh 60 se kam</code> &rarr; milk under 60).</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 2 &mdash; Hybrid Search</div>
+          <p>Embed the query with bge-m3 (cached). Run TypeSense <strong>hybrid search</strong>: BM25 keyword match on <code>title, tags, aliases</code> + vector k-NN &mdash; filtered by <code>store_ids</code> for the user's pincode.</p>
+        </div>
+        <div class="flow-step">
+          <div class="step-label">Step 3 &mdash; Demand Signal</div>
+          <p>If no keyword matched <strong>and</strong> the nearest vector is far, flag it as <code>missed</code>. This surfaces to the admin dashboard as a demand signal &mdash; close the loop by mapping it to a product.</p>
+        </div>
+      </section>
+
+      <!-- ─── Why These Choices ─── -->
+      <section>
+        <h2>Why These Choices</h2>
+        <table class="decision-table">
+          <thead>
+            <tr><th>Decision</th><th>Why</th><th>Tradeoff</th></tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>TypeSense for hybrid search</td>
+              <td>BM25 + vector k-NN + typo tolerance in a single hop. No need to stitch Elasticsearch + a separate vector DB.</td>
+              <td>Fewer heavy analytics than Elasticsearch. Index lives in RAM. Fine for search-first at this scale.</td>
+            </tr>
+            <tr>
+              <td>Kafka as ingestion buffer</td>
+              <td>Decouples write API from three stores. Replay, fan-out, DLQ for free. Demonstrates event-driven design.</td>
+              <td>Heavier than this catalog strictly needs. At low write volume, direct writes would work. Here for the pattern.</td>
+            </tr>
+            <tr>
+              <td>Ollama (local models)</td>
+              <td>bge-m3 is genuinely multilingual (core of cross-language search). Gemma 3 4B generates tags. Zero API costs, runs offline.</td>
+              <td>Slow on CPU (~5-10s for tags). 4B model doesn't know every brand. That's why tags are rule-first with LLM as optional enrich.</td>
+            </tr>
+            <tr>
+              <td>Rule-first 14-language tags</td>
+              <td>Curated dictionary + Devanagari-to-script transliteration. Instant, deterministic, no LLM latency for common products.</td>
+              <td>Transliteration is phonetic, not translation (Marathi ~ Hindi script). Upgrade path: AI4Bharat IndicXlit.</td>
+            </tr>
+            <tr>
+              <td>MongoDB = source of truth</td>
+              <td>Everything else (TypeSense, Redis) rebuilds from Mongo. <code>reindex</code> replays Mongo &rarr; search + cache. Index corruption is recoverable.</td>
+              <td>Extra write on the ingest path. Worth it for recoverability.</td>
+            </tr>
+            <tr>
+              <td>Browser Speech API for voice</td>
+              <td>Zero backend, zero latency. hi-IN continuous mode with live transcript. Blinkit-style overlay UX.</td>
+              <td>Browser-dependent (Chrome best). No server-side fallback. Acceptable for a demo.</td>
+            </tr>
+          </tbody>
+        </table>
+      </section>
+
+      <!-- ─── Key Engineering Details ─── -->
+      <section>
+        <h2>Key Engineering Details</h2>
+        <ul>
+          <li><strong>Hybrid search fusion</strong> &mdash; TypeSense runs BM25 keyword search and vector k-NN in a single query, fused internally. No separate re-ranking step needed.</li>
+          <li><strong>Store-scoped filtering</strong> &mdash; Each product has a <code>store_ids</code> array. Search filters by the user's resolved store, so results only show in-stock items at their nearest dark store.</li>
+          <li><strong>Exactly-once semantics (practical)</strong> &mdash; Kafka offset committed only after all three stores succeed. Idempotent upserts mean retries don't duplicate. 3 failures &rarr; DLQ for manual inspection.</li>
+          <li><strong>Content safety gate</strong> &mdash; <code>guardTags()</code> is fail-closed: veg/non-veg correctness, no slurs, clean data. Runs before any tag is persisted.</li>
+          <li><strong>Recipe detection (two-tier)</strong> &mdash; Instant KB dictionary (5 common dishes) &rarr; Gemma 3 LLM fallback for novel dishes. Hinglish trigger phrases like "banana hai" activate it. Veg-only, fail-closed.</li>
+          <li><strong>Search analytics loop</strong> &mdash; Every search, click, and add-to-cart is logged. Dashboard shows CTR, zero-result rate, searches by script, per-day trends. Missed queries surface as demand signals.</li>
+        </ul>
+      </section>
+
+      <!-- ─── Repo Structure ─── -->
+      <section>
+        <h2>Repo Structure</h2>
+        <div class="diagram-container">
+          <pre style="font-size: 0.85rem; line-height: 1.6; color: var(--text);">zepkit/
+├── docker-compose.yml          # Kafka, TypeSense, Redis, MongoDB
+├── packages/common/            # shared config, event contracts, store clients
+├── services/
+│   ├── ai-service/             # Ollama wrapper: tags + embeddings + guard + recipe
+│   ├── api-gateway/            # search, products, locations, analytics, RBAC
+│   └── worker/                 # Kafka consumer -> Mongo / TypeSense / Redis + DLQ
+├── infra/                      # TypeSense schema, Kafka topics
+├── scripts/                    # bootstrap, seed, embedding checks
+├── web/                        # shop UI (voice overlay) + admin UI
+└── docs/                       # rules, content-safety, scoped search</pre>
+        </div>
+      </section>
+
+      <!-- ─── What's Next ─── -->
+      <section>
+        <h2>What I'd Do Next</h2>
+        <ul>
+          <li><strong>Learning-to-rank</strong> from click/add events already being logged</li>
+          <li><strong>Real transliteration</strong> via AI4Bharat IndicXlit (replace phonetic mapping)</li>
+          <li><strong>Cross-lingual eval harness</strong> &mdash; per-language precision@k on a labelled query set</li>
+          <li><strong>Observability</strong> &mdash; Kafka lag, search latency histograms, DLQ alerts</li>
+        </ul>
+      </section>
+    </main>
+
+    <footer>
+      <p>Ridhesh &middot; <a href="../index.html" style="color: var(--muted);">All projects</a></p>
+    </footer>
+  </div>
+  <script>
+    // Store raw mermaid source before it gets replaced by SVG
+    var mermaidSource = document.querySelector('#arch-diagram .mermaid').textContent;
+
+    var isDark = document.documentElement.getAttribute('data-theme') === 'dark';
+    mermaid.initialize({ startOnLoad: true, theme: isDark ? 'dark' : 'neutral' });
+
+    async function rerenderDiagram() {
+      var container = document.getElementById('arch-diagram');
+      var dark = document.documentElement.getAttribute('data-theme') === 'dark';
+      container.innerHTML = '';
+      var pre = document.createElement('pre');
+      pre.className = 'mermaid';
+      pre.textContent = mermaidSource;
+      container.appendChild(pre);
+      mermaid.initialize({ startOnLoad: false, theme: dark ? 'dark' : 'neutral' });
+      await mermaid.run({ nodes: [pre] });
+    }
+
+    var btn = document.querySelector('.theme-toggle');
+    function setLabel() {
+      btn.textContent = document.documentElement.getAttribute('data-theme') === 'dark' ? 'Light' : 'Dark';
+    }
+    setLabel();
+    btn.addEventListener('click', function() {
+      var next = document.documentElement.getAttribute('data-theme') === 'dark' ? 'light' : 'dark';
+      document.documentElement.setAttribute('data-theme', next);
+      localStorage.setItem('theme', next);
+      setLabel();
+      rerenderDiagram();
+    });
+  </script>
+</body>
+</html>
